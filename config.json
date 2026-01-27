@@ -1,0 +1,13 @@
+{
+  "api_id": 32834673,
+  "api_hash": "7894d2351fc4202e683d7e4f33706cc1",
+  "source_chat_id": 3307641780,
+  "notify_chat_id": 3727425191,
+  "min_distance": 1.0,
+  "ignore_forwarded": false,
+  "enable_graph_screenshot": true,
+  "screenshot_timeout_ms": 15000,
+  "screenshot_wait_ms": 1500,
+  "screenshot_viewport": "1280x720",
+  "screenshot_full_page": true
+}
