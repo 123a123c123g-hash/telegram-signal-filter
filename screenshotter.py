@@ -1,5 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -105,16 +106,51 @@ class GraphScreenshotter:
         self._cache: dict[str, tuple[float, str]] = {}
         self._counter = 0
         self._semaphore = None
+        self._semaphore_by_exchange = {}
+        self._playwright = None
+        self._browsers = {}
+        self._contexts = {}
+        self._context_locks = {}
         os.makedirs(self._config.screenshots_dir, exist_ok=True)
         self._cleanup_old_files()
 
-    def _get_semaphore(self):
-        if self._semaphore is None:
-            import asyncio
+        def _get_semaphore(self, exchange_key: str | None = None):
+        key = (exchange_key or "default").lower()
+        if self._semaphore_by_exchange is None:
+            self._semaphore_by_exchange = {}
+        sem = self._semaphore_by_exchange.get(key)
+        if sem is None:
+            limit = max(1, int(self._config.max_parallel))
+            sem = asyncio.Semaphore(limit)
+            self._semaphore_by_exchange[key] = sem
+        return sem
 
-            self._semaphore = asyncio.Semaphore(self._config.max_parallel)
-        return self._semaphore
-
+    async def _get_context(self, exchange_key: str | None = None):
+        key = (exchange_key or "default").lower()
+        lock = self._context_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._context_locks[key] = lock
+        async with lock:
+            ctx = self._contexts.get(key)
+            if ctx is not None:
+                try:
+                    if not ctx.is_closed():
+                        return ctx
+                except Exception:
+                    pass
+            if self._playwright is None:
+                self._playwright = await async_playwright().start()
+            browser = self._browsers.get(key)
+            if browser is None or browser.is_closed():
+                browser = await self._playwright.chromium.launch(headless=True)
+                self._browsers[key] = browser
+            ctx = await browser.new_context(
+                viewport={"width": self._config.viewport[0], "height": self._config.viewport[1]}
+            )
+            self._contexts[key] = ctx
+            self._logger.info("Screenshot context initialized: exchange=%s", key)
+            return ctx
     async def take_screenshot(self, url: str) -> str | None:
         if not self._config.enabled:
             return None
@@ -123,7 +159,7 @@ class GraphScreenshotter:
         if cached and now - cached[0] <= self._config.cache_ttl_sec and os.path.exists(cached[1]):
             return cached[1]
 
-        sem = self._get_semaphore()
+        sem = self._get_semaphore((exchange or "").strip().lower())
         async with sem:
             now = time.time()
             cached = self._cache.get(url)
@@ -145,17 +181,45 @@ class GraphScreenshotter:
     async def _capture(self, url: str) -> str | None:
         filename = f"graph_{int(time.time())}_{hashlib.sha1(url.encode('utf-8')).hexdigest()[:10]}.png"
         path = os.path.join(self._config.screenshots_dir, filename)
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                viewport={"width": self._config.viewport[0], "height": self._config.viewport[1]}
+                context = await self._get_context(exchange_key)
+        page = await context.new_page()
+        await _goto_with_retry(
+            page,
+            url,
+            wait_until_final,
+            goto_timeout,
+            self._logger,
+            retry_on_network_change,
+        )
+        if force_reload:
+            await _reload_with_retry(
+                page,
+                wait_until_final,
+                goto_timeout,
+                self._logger,
+                retry_on_network_change,
             )
-            page = await context.new_page()
-            await page.goto(url, wait_until="networkidle", timeout=self._config.timeout_ms)
-            await page.wait_for_timeout(self._config.wait_ms)
-            await page.screenshot(path=path, full_page=self._config.full_page)
-            await context.close()
-            await browser.close()
+        wait_ms = self._config.wait_ms if force_wait_ms is None else max(0, int(force_wait_ms))
+        await page.wait_for_timeout(wait_ms)
+        if exchange_key == "bybit":
+            ready_ok = await _wait_bybit_ready(
+                page,
+                self._config.bybit_ready_timeout_ms,
+                self._config.bybit_after_ready_sleep_ms,
+                self._config.bybit_blank_retry,
+                self._config.bybit_blank_threshold,
+                self._logger,
+            )
+            if not ready_ok:
+                await page.close()
+                return None
+        if apply_delay and delay_sec > 0:
+            self._logger.info(
+                "Screenshot delay applied: exchange=%s delay=%.1fs", exchange_key, delay_sec
+            )
+            await page.wait_for_timeout(int(delay_sec * 1000))
+        await page.screenshot(path=path, full_page=self._config.full_page)
+        await page.close()
         return path
 
     def _cleanup_old_files(self) -> None:
@@ -167,3 +231,4 @@ class GraphScreenshotter:
                     os.remove(path)
             except Exception:
                 self._logger.exception("Failed to remove old screenshot %s", path)
+
